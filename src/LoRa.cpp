@@ -473,7 +473,7 @@ void LoRaClass::setTxPower(int level, int outputPin)
 
       // High Power +20 dBm Operation (Semtech SX1276/77/78/79 5.4.3.)
       writeRegister(REG_PA_DAC, 0x87);
-      setOCP(140);
+      setOCP(240);
     } else {
       if (level < 2) {
         level = 2;
