@@ -98,12 +98,14 @@ public:
 
   void dumpRegisters(Stream& out);
 
+  bool isTransmitting();
+
 private:
   void explicitHeaderMode();
   void implicitHeaderMode();
 
   void handleDio0Rise();
-  bool isTransmitting();
+  
 
   int getSpreadingFactor();
   long getSignalBandwidth();
