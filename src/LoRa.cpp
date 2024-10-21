@@ -2,6 +2,7 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <LoRa.h>
+#include <algorithm>
 
 // registers
 #define REG_FIFO                 0x00
@@ -23,6 +24,7 @@
 #define REG_RSSI_VALUE           0x1b
 #define REG_MODEM_CONFIG_1       0x1d
 #define REG_MODEM_CONFIG_2       0x1e
+#define REG_SYMB_TIMEOUT         0x1f
 #define REG_PREAMBLE_MSB         0x20
 #define REG_PREAMBLE_LSB         0x21
 #define REG_PAYLOAD_LENGTH       0x22
@@ -148,6 +150,11 @@ int LoRaClass::begin(long frequency)
   // set output power to 17 dBm
   setTxPower(17);
 
+  //set preamble timeout paramter. symbol time ~.3ms
+  //1000 symbols -> 256ms
+  setPreambleTimeout(1000);
+
+
   // put in standby mode
   idle();
 
@@ -232,7 +239,7 @@ int LoRaClass::parsePacket(int size)
   } else {
     explicitHeaderMode();
   }
-
+  
   // clear IRQ's
   writeRegister(REG_IRQ_FLAGS, irqFlags);
 
@@ -611,6 +618,18 @@ void LoRaClass::setPreambleLength(long length)
   writeRegister(REG_PREAMBLE_MSB, (uint8_t)(length >> 8));
   writeRegister(REG_PREAMBLE_LSB, (uint8_t)(length >> 0));
 }
+
+void LoRaClass::setPreambleTimeout(uint16_t timeout)
+{
+  uint16_t nSymbols = std::max(timeout,static_cast<uint16_t>(1023)); // mask to max 1023
+  uint8_t preambleMSB = nSymbols >> 8;
+  uint8_t preambleLSB = nSymbols & 0xff;
+
+  writeRegister(REG_MODEM_CONFIG_2,(readRegister(REG_MODEM_CONFIG_2) & ~0b11) | preambleMSB);
+  writeRegister(REG_SYMB_TIMEOUT,preambleLSB);
+  
+}
+
 
 void LoRaClass::setSyncWord(int sw)
 {

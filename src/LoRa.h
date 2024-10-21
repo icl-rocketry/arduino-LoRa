@@ -74,6 +74,7 @@ public:
   void setSignalBandwidth(long sbw);
   void setCodingRate4(int denominator);
   void setPreambleLength(long length);
+  void setPreambleTimeout(uint16_t timeout);
   void setSyncWord(int sw);
   void enableCrc();
   void disableCrc();
@@ -101,6 +102,7 @@ public:
   bool isTransmitting();
 
 private:
+
   void explicitHeaderMode();
   void implicitHeaderMode();
 
