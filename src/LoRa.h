@@ -6,6 +6,8 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <functional>
+#include <mutex>
 
 #if defined(ARDUINO_SAMD_MKRWAN1300)
 #define LORA_DEFAULT_SPI           SPI1
@@ -33,6 +35,7 @@
 class LoRaClass : public Stream {
 public:
   LoRaClass();
+  ~LoRaClass();
 
   int begin(long frequency);
   void end();
@@ -57,14 +60,14 @@ public:
   virtual int peek();
   virtual void flush();
 
-#ifndef ARDUINO_SAMD_MKRWAN1300
-  void onReceive(void(*callback)(int));
-  void onCadDone(void(*callback)(boolean));
-  void onTxDone(void(*callback)());
+
+  void onReceive(std::function<void(int)> callback);
+  void onCadDone(std::function<void(bool)> callback);
+  void onTxDone(std::function<void()> callback);
 
   void receive(int size = 0);
   void channelActivityDetection(void);
-#endif
+
   void idle();
   void sleep();
 
@@ -106,9 +109,6 @@ private:
   void explicitHeaderMode();
   void implicitHeaderMode();
 
-  void handleDio0Rise();
-  
-
   int getSpreadingFactor();
   long getSignalBandwidth();
 
@@ -119,7 +119,12 @@ private:
   void writeRegister(uint8_t address, uint8_t value);
   uint8_t singleTransfer(uint8_t address, uint8_t value);
 
-  static void onDio0Rise();
+  
+  IRAM_ATTR void handleDio0Rise();
+  static IRAM_ATTR void Dio0RiseHandler(void* arg);
+  
+  void registerInterruptHandler();
+  void unregisterInterruptHandler();
 
 private:
   SPISettings _spiSettings;
@@ -130,11 +135,34 @@ private:
   long _frequency;
   int _packetIndex;
   int _implicitHeaderMode;
-  void (*_onReceive)(int);
-  void (*_onCadDone)(boolean);
-  void (*_onTxDone)();
+
+  //callbacks
+  std::mutex m_callbackMutex;
+  std::function<void(int)> _onReceive;
+  std::function<void(bool)> _onCadDone;
+  std::function<void()> _onTxDone;
+
+private:
+  //Dio0 handler task
+  TaskHandle_t m_dio0HandlerTask;
+
+  //Dio0 handler task stack size
+  static constexpr size_t m_dio0HandlerTaskStackSize = 2048;
+  //Dio0 handler task priority
+  const UBaseType_t m_dio0HandlerTaskPriority = 1;
+  //Dio0 handler task stack
+  std::array<uint8_t, m_dio0HandlerTaskStackSize> m_dio0HandlerTaskStack;
+  //Dio0 handler task buffer
+  StaticTask_t m_dio0HandlerTaskBuffer;
+
+  //Dio0 handler task notification
+  // TaskNotification m_dio0HandlerTaskNotification;
+
+  bool spawnDio0HandlerTask();
+
+
 };
 
-extern LoRaClass LoRa;
 
-#endif
+
+

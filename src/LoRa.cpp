@@ -3,6 +3,8 @@
 
 #include <LoRa.h>
 #include <algorithm>
+#include <functional>
+#include <mutex>
 
 // registers
 #define REG_FIFO                 0x00
@@ -67,11 +69,6 @@
 
 #define MAX_PKT_LENGTH           255
 
-#if (ESP8266 || ESP32)
-    #define ISR_PREFIX ICACHE_RAM_ATTR
-#else
-    #define ISR_PREFIX
-#endif
 
 LoRaClass::LoRaClass() :
   _spiSettings(LORA_DEFAULT_SPI_FREQUENCY, MSBFIRST, SPI_MODE0),
@@ -86,26 +83,23 @@ LoRaClass::LoRaClass() :
 {
   // overide Stream timeout value
   setTimeout(0);
+  registerInterruptHandler();
+  spawnDio0HandlerTask();
+}
+
+LoRaClass::~LoRaClass()
+{
+  unregisterInterruptHandler();
+  // if ((offTaskHandle != nullptr) && (eTaskGetState(offTaskHandle) != eTaskState::eDeleted))
+  //           {
+  //               vTaskDelete(offTaskHandle); // I beg this doesnt crash
+  //               offTaskHandle = nullptr;
+  //           }
+  //TODO block until task is deleted
 }
 
 int LoRaClass::begin(long frequency)
 {
-#if defined(ARDUINO_SAMD_MKRWAN1300) || defined(ARDUINO_SAMD_MKRWAN1310)
-  pinMode(LORA_IRQ_DUMB, OUTPUT);
-  digitalWrite(LORA_IRQ_DUMB, LOW);
-
-  // Hardware reset
-  pinMode(LORA_BOOT0, OUTPUT);
-  digitalWrite(LORA_BOOT0, LOW);
-
-  pinMode(LORA_RESET, OUTPUT);
-  digitalWrite(LORA_RESET, HIGH);
-  delay(200);
-  digitalWrite(LORA_RESET, LOW);
-  delay(200);
-  digitalWrite(LORA_RESET, HIGH);
-  delay(50);
-#endif
 
   // setup pins
   pinMode(_ss, OUTPUT);
@@ -369,60 +363,107 @@ void LoRaClass::flush()
 {
 }
 
-#ifndef ARDUINO_SAMD_MKRWAN1300
-void LoRaClass::onReceive(void(*callback)(int))
+
+void LoRaClass::onReceive(std::function<void(int)> callback)
 {
+  std::scoped_lock lock(m_callbackMutex);
+  {
   _onReceive = callback;
-
-  if (callback) {
-    pinMode(_dio0, INPUT);
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
-    attachInterrupt(digitalPinToInterrupt(_dio0), LoRaClass::onDio0Rise, RISING);
-  } else {
-    detachInterrupt(digitalPinToInterrupt(_dio0));
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.notUsingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
   }
+
+
+  
 }
 
-void LoRaClass::onCadDone(void(*callback)(boolean))
+void LoRaClass::onCadDone(std::function<void(bool)> callback)
 {
-  _onCadDone = callback;
-
-  if (callback) {
-    pinMode(_dio0, INPUT);
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
-    attachInterrupt(digitalPinToInterrupt(_dio0), LoRaClass::onDio0Rise, RISING);
-  } else {
-    detachInterrupt(digitalPinToInterrupt(_dio0));
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.notUsingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
+  std::scoped_lock lock(m_callbackMutex);
+  {
+    _onCadDone = callback;
   }
+  
+
+  
 }
 
-void LoRaClass::onTxDone(void(*callback)())
+void LoRaClass::onTxDone(std::function<void()> callback)
 {
-  _onTxDone = callback;
-
-  if (callback) {
-    pinMode(_dio0, INPUT);
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.usingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
-    attachInterrupt(digitalPinToInterrupt(_dio0), LoRaClass::onDio0Rise, RISING);
-  } else {
-    detachInterrupt(digitalPinToInterrupt(_dio0));
-#ifdef SPI_HAS_NOTUSINGINTERRUPT
-    SPI.notUsingInterrupt(digitalPinToInterrupt(_dio0));
-#endif
+  std::scoped_lock lock(m_callbackMutex);
+  {
+    _onTxDone = callback;
   }
+
 }
+
+void LoRaClass::registerInterruptHandler()
+{
+
+  pinMode(_dio0, INPUT);
+ 
+  // attachInterrupt(digitalPinToInterrupt(_dio0), Dio0RiseHandler, RISING);
+  attachInterruptArg(digitalPinToInterrupt(_dio0), Dio0RiseHandler, static_cast<void*>(this), RISING);
+
+}
+
+void LoRaClass::unregisterInterruptHandler()
+{
+  detachInterrupt(digitalPinToInterrupt(_dio0));
+
+}
+
+IRAM_ATTR void LoRaClass::Dio0RiseHandler(void* arg)
+{
+  //TODO ensure safety of this to make sure class isnt destructed while this is called
+
+  if (arg == nullptr)
+  {
+    return;
+  }
+
+  LoRaClass* lora = static_cast<LoRaClass*>(arg);
+  lora->handleDio0Rise(); // todo instead notify dio0 handler task to hanlde spi comms
+}
+
+//todo wrap this in a task with high priority
+IRAM_ATTR void LoRaClass::handleDio0Rise()
+{
+  int irqFlags = readRegister(REG_IRQ_FLAGS);
+
+  //! wondering if this should happen after we process everything to prevent multiple interrupts occuring
+  // clear IRQ's
+  // writeRegister(REG_IRQ_FLAGS, irqFlags);
+
+  if ((irqFlags & IRQ_CAD_DONE_MASK) != 0) {
+    if (_onCadDone) {
+      _onCadDone((irqFlags & IRQ_CAD_DETECTED_MASK) != 0);
+    }
+  } else if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
+
+    if ((irqFlags & IRQ_RX_DONE_MASK) != 0) {
+      // received a packet
+      _packetIndex = 0;
+
+      // read packet length
+      int packetLength = _implicitHeaderMode ? readRegister(REG_PAYLOAD_LENGTH) : readRegister(REG_RX_NB_BYTES);
+
+      // set FIFO address to current RX address
+      writeRegister(REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_CURRENT_ADDR));
+
+      if (_onReceive) {
+        _onReceive(packetLength);
+      }
+    } else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
+      if (_onTxDone) {
+        _onTxDone();
+      }
+    }
+  }
+
+  // clear IRQ's
+  writeRegister(REG_IRQ_FLAGS, irqFlags);
+}
+
+
 
 void LoRaClass::receive(int size)
 {
@@ -445,7 +486,7 @@ void LoRaClass::channelActivityDetection(void)
   writeRegister(REG_DIO_MAPPING_1, 0x80);// DIO0 => CADDONE
   writeRegister(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_CAD);
 }
-#endif
+
 
 void LoRaClass::idle()
 {
@@ -753,39 +794,7 @@ void LoRaClass::implicitHeaderMode()
   writeRegister(REG_MODEM_CONFIG_1, readRegister(REG_MODEM_CONFIG_1) | 0x01);
 }
 
-void LoRaClass::handleDio0Rise()
-{
-  int irqFlags = readRegister(REG_IRQ_FLAGS);
 
-  // clear IRQ's
-  writeRegister(REG_IRQ_FLAGS, irqFlags);
-
-  if ((irqFlags & IRQ_CAD_DONE_MASK) != 0) {
-    if (_onCadDone) {
-      _onCadDone((irqFlags & IRQ_CAD_DETECTED_MASK) != 0);
-    }
-  } else if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
-
-    if ((irqFlags & IRQ_RX_DONE_MASK) != 0) {
-      // received a packet
-      _packetIndex = 0;
-
-      // read packet length
-      int packetLength = _implicitHeaderMode ? readRegister(REG_PAYLOAD_LENGTH) : readRegister(REG_RX_NB_BYTES);
-
-      // set FIFO address to current RX address
-      writeRegister(REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_CURRENT_ADDR));
-
-      if (_onReceive) {
-        _onReceive(packetLength);
-      }
-    } else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
-      if (_onTxDone) {
-        _onTxDone();
-      }
-    }
-  }
-}
 
 uint8_t LoRaClass::readRegister(uint8_t address)
 {
@@ -811,9 +820,9 @@ uint8_t LoRaClass::singleTransfer(uint8_t address, uint8_t value)
   return response;
 }
 
-ISR_PREFIX void LoRaClass::onDio0Rise()
-{
-  LoRa.handleDio0Rise();
-}
+// ISR_PREFIX void LoRaClass::onDio0Rise()
+// {
+//   LoRa.handleDio0Rise();
+// }
 
-LoRaClass LoRa;
+// LoRaClass LoRa;
