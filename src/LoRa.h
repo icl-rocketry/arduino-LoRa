@@ -1,13 +1,19 @@
 // Copyright (c) Sandeep Mistry. All rights reserved.
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
-#ifndef LORA_H
-#define LORA_H
+#pragma once
+
+
+#include <functional>
+#include <mutex>
+#include <atomic>
+#include <array>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include <Arduino.h>
 #include <SPI.h>
-#include <functional>
-#include <mutex>
 
 #if defined(ARDUINO_SAMD_MKRWAN1300)
 #define LORA_DEFAULT_SPI           SPI1
@@ -120,7 +126,7 @@ private:
   uint8_t singleTransfer(uint8_t address, uint8_t value);
 
   
-  IRAM_ATTR void handleDio0Rise();
+  void handleDio0Rise();
   static IRAM_ATTR void Dio0RiseHandler(void* arg);
   
   void registerInterruptHandler();
@@ -137,7 +143,9 @@ private:
   int _implicitHeaderMode;
 
   //callbacks
-  std::mutex m_callbackMutex;
+  std::mutex m_onReceiveCBMutex;
+  std::mutex m_onCadDoneCBMutex;
+  std::mutex m_onTxDoneCBMutex;
   std::function<void(int)> _onReceive;
   std::function<void(bool)> _onCadDone;
   std::function<void()> _onTxDone;
@@ -149,16 +157,15 @@ private:
   //Dio0 handler task stack size
   static constexpr size_t m_dio0HandlerTaskStackSize = 2048;
   //Dio0 handler task priority
-  const UBaseType_t m_dio0HandlerTaskPriority = 1;
+  const UBaseType_t m_dio0HandlerTaskPriority = configMAX_PRIORITIES - 1;
   //Dio0 handler task stack
   std::array<uint8_t, m_dio0HandlerTaskStackSize> m_dio0HandlerTaskStack;
   //Dio0 handler task buffer
   StaticTask_t m_dio0HandlerTaskBuffer;
 
-  //Dio0 handler task notification
-  // TaskNotification m_dio0HandlerTaskNotification;
-
   bool spawnDio0HandlerTask();
+
+
 
 
 };

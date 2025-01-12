@@ -2,9 +2,15 @@
 // Licensed under the MIT license. See LICENSE file in the project root for full license information.
 
 #include <LoRa.h>
+
 #include <algorithm>
 #include <functional>
 #include <mutex>
+#include <array>
+#include <atomic>
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 // registers
 #define REG_FIFO                 0x00
@@ -83,23 +89,38 @@ LoRaClass::LoRaClass() :
 {
   // overide Stream timeout value
   setTimeout(0);
-  registerInterruptHandler();
-  spawnDio0HandlerTask();
 }
 
 LoRaClass::~LoRaClass()
 {
   unregisterInterruptHandler();
-  // if ((offTaskHandle != nullptr) && (eTaskGetState(offTaskHandle) != eTaskState::eDeleted))
-  //           {
-  //               vTaskDelete(offTaskHandle); // I beg this doesnt crash
-  //               offTaskHandle = nullptr;
-  //           }
+  //notify task to exit
+  if (m_dio0HandlerTask != nullptr)
+  {
+    eTaskState state = eTaskGetState(m_dio0HandlerTask);
+    while ((state != eTaskState::eDeleted) || (state != eTaskState::eInvalid))
+    {
+      xTaskNotify(m_dio0HandlerTask, 1, eSetValueWithOverwrite);
+      vTaskDelay(1);
+      state = eTaskGetState(m_dio0HandlerTask);
+    }
+  }
+  //block until task is deleted
+
   //TODO block until task is deleted
 }
 
 int LoRaClass::begin(long frequency)
 {
+
+  registerInterruptHandler();
+  if (!spawnDio0HandlerTask())
+  {
+    unregisterInterruptHandler();
+    //! Failed to spawn handler task
+    //need to log this
+    return 0;
+  }
 
   // setup pins
   pinMode(_ss, OUTPUT);
@@ -366,41 +387,26 @@ void LoRaClass::flush()
 
 void LoRaClass::onReceive(std::function<void(int)> callback)
 {
-  std::scoped_lock lock(m_callbackMutex);
-  {
+  std::scoped_lock lock(m_onReceiveCBMutex);
   _onReceive = callback;
-  }
-
-
-  
 }
 
 void LoRaClass::onCadDone(std::function<void(bool)> callback)
 {
-  std::scoped_lock lock(m_callbackMutex);
-  {
-    _onCadDone = callback;
-  }
-  
-
-  
+  std::scoped_lock lock(m_onCadDoneCBMutex);
+  _onCadDone = callback;
 }
 
 void LoRaClass::onTxDone(std::function<void()> callback)
 {
-  std::scoped_lock lock(m_callbackMutex);
-  {
-    _onTxDone = callback;
-  }
-
+  std::scoped_lock lock(m_onTxDoneCBMutex);
+  _onTxDone = callback;
 }
 
 void LoRaClass::registerInterruptHandler()
 {
 
   pinMode(_dio0, INPUT);
- 
-  // attachInterrupt(digitalPinToInterrupt(_dio0), Dio0RiseHandler, RISING);
   attachInterruptArg(digitalPinToInterrupt(_dio0), Dio0RiseHandler, static_cast<void*>(this), RISING);
 
 }
@@ -421,11 +427,30 @@ IRAM_ATTR void LoRaClass::Dio0RiseHandler(void* arg)
   }
 
   LoRaClass* lora = static_cast<LoRaClass*>(arg);
-  lora->handleDio0Rise(); // todo instead notify dio0 handler task to hanlde spi comms
+
+  if (lora->m_dio0HandlerTask == nullptr)
+  {
+    //TODO log invalid task handle
+    return;
+  }
+  BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+  //notify dio0 handler task to handle spi comms
+  if (!xTaskNotifyFromISR(lora->m_dio0HandlerTask, 0, eSetValueWithoutOverwrite, &xHigherPriorityTaskWoken))
+  {
+    //failure to notify likely due to notification already pending in task
+    //TODO some sort of logging
+    return;
+  }
+
+  //force context switch if higher priority task was woken
+  portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+  
+
 }
 
-//todo wrap this in a task with high priority
-IRAM_ATTR void LoRaClass::handleDio0Rise()
+
+void LoRaClass::handleDio0Rise()
 {
   int irqFlags = readRegister(REG_IRQ_FLAGS);
 
@@ -434,9 +459,14 @@ IRAM_ATTR void LoRaClass::handleDio0Rise()
   // writeRegister(REG_IRQ_FLAGS, irqFlags);
 
   if ((irqFlags & IRQ_CAD_DONE_MASK) != 0) {
-    if (_onCadDone) {
-      _onCadDone((irqFlags & IRQ_CAD_DETECTED_MASK) != 0);
+
+    {
+      std::scoped_lock lock(m_onCadDoneCBMutex);
+      if (_onCadDone) {
+        _onCadDone((irqFlags & IRQ_CAD_DETECTED_MASK) != 0);
+      }
     }
+
   } else if ((irqFlags & IRQ_PAYLOAD_CRC_ERROR_MASK) == 0) {
 
     if ((irqFlags & IRQ_RX_DONE_MASK) != 0) {
@@ -449,13 +479,22 @@ IRAM_ATTR void LoRaClass::handleDio0Rise()
       // set FIFO address to current RX address
       writeRegister(REG_FIFO_ADDR_PTR, readRegister(REG_FIFO_RX_CURRENT_ADDR));
 
-      if (_onReceive) {
-        _onReceive(packetLength);
+      {
+        std::scoped_lock lock(m_onReceiveCBMutex);
+        if (_onReceive) {
+          _onReceive(packetLength);
+        }
       }
+
     } else if ((irqFlags & IRQ_TX_DONE_MASK) != 0) {
-      if (_onTxDone) {
-        _onTxDone();
+
+      {
+        std::scoped_lock lock(m_onTxDoneCBMutex);
+        if (_onTxDone) {
+          _onTxDone();
+        }
       }
+
     }
   }
 
@@ -463,6 +502,42 @@ IRAM_ATTR void LoRaClass::handleDio0Rise()
   writeRegister(REG_IRQ_FLAGS, irqFlags);
 }
 
+bool LoRaClass::spawnDio0HandlerTask()
+{
+
+  auto dio0HandlerTaskCode = [](void* arg) -> void {
+    LoRaClass* lora = static_cast<LoRaClass*>(arg);
+
+    for (;;)
+    {
+      uint32_t notificationData = ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+      if (notificationData == 1)
+      {
+        //exit task
+        break;
+      }
+      //block on notification
+      //notifcation either wakes task or kills it
+      lora->handleDio0Rise();
+    }
+
+    //exit task
+    vTaskDelete(nullptr);
+
+  };
+
+  m_dio0HandlerTask = xTaskCreateStaticPinnedToCore(dio0HandlerTaskCode,
+                                       "LoRaDio0HandlerTask",
+                                       m_dio0HandlerTaskStackSize,
+                                       this,
+                                       m_dio0HandlerTaskPriority,
+                                       m_dio0HandlerTaskStack.data(),
+                                       &m_dio0HandlerTaskBuffer,
+                                       1);
+
+  return m_dio0HandlerTask != nullptr;
+}
 
 
 void LoRaClass::receive(int size)
@@ -820,9 +895,3 @@ uint8_t LoRaClass::singleTransfer(uint8_t address, uint8_t value)
   return response;
 }
 
-// ISR_PREFIX void LoRaClass::onDio0Rise()
-// {
-//   LoRa.handleDio0Rise();
-// }
-
-// LoRaClass LoRa;
